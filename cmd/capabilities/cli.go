@@ -17,7 +17,13 @@ import (
 	"github.com/rawphp/capabilities-cli/internal/run"
 )
 
-// Version is the CLI version string.
+// Version is the CLI version string printed by `capabilities version`.
+// Release builds override it at link time (package main → symbol main.Version):
+//
+//	go build -ldflags "-X main.Version=0.2.0" ./cmd/capabilities
+//
+// Prefer the git tag without a leading "v" (e.g. tag v0.2.0 → 0.2.0).
+// Default remains a sensible dev string when ldflags are not injected.
 var Version = "0.2.0"
 
 // BinaryName is the product binary name (D-016).
@@ -157,6 +163,18 @@ func flagBool(args []string, names ...string) (bool, []string) {
 	return found, out
 }
 
+
+// wantsHelp reports whether args contain a help flag (-h or --help).
+// Help wins before auth/network/side effects for any subcommand.
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
 func profileAndBase(args []string) (profile, base string, rest []string) {
 	profile, args = flagValue(args, "--profile")
 	if profile == "" {
@@ -237,6 +255,10 @@ func cmdAuth(env Env, args []string) int {
 }
 
 func cmdCatalog(env Env, args []string) int {
+	if wantsHelp(args) {
+		fmt.Fprint(env.Stdout, CommandHelp("catalog"))
+		return api.ExitOK
+	}
 	st := store(env)
 	profile, base, args := profileAndBase(args)
 	jsonOut, args := flagBool(args, "--json")
@@ -282,6 +304,10 @@ func cmdCatalog(env Env, args []string) int {
 }
 
 func cmdDescribe(env Env, args []string) int {
+	if wantsHelp(args) {
+		fmt.Fprint(env.Stdout, CommandHelp("describe"))
+		return api.ExitOK
+	}
 	st := store(env)
 	profile, base, args := profileAndBase(args)
 	jsonOut, args := flagBool(args, "--json")
@@ -324,6 +350,10 @@ func cmdDescribe(env Env, args []string) int {
 }
 
 func cmdRun(env Env, args []string) int {
+	if wantsHelp(args) {
+		fmt.Fprint(env.Stdout, CommandHelp("run"))
+		return api.ExitOK
+	}
 	st := store(env)
 	profile, base, args := profileAndBase(args)
 	input, args := flagValue(args, "--input")
@@ -382,6 +412,10 @@ func cmdRun(env Env, args []string) int {
 }
 
 func cmdMcp(env Env, args []string) int {
+	if wantsHelp(args) {
+		fmt.Fprint(env.Stdout, CommandHelp("mcp"))
+		return api.ExitOK
+	}
 	st := store(env)
 	profile, base, _ := profileAndBase(args)
 	if err := auth.GuardAuth(st, profile, "mcp"); err != nil {
@@ -403,6 +437,10 @@ func cmdMcp(env Env, args []string) int {
 }
 
 func cmdApprovals(env Env, args []string) int {
+	if wantsHelp(args) {
+		fmt.Fprint(env.Stdout, CommandHelp("approvals"))
+		return api.ExitOK
+	}
 	st := store(env)
 	profile, base, args := profileAndBase(args)
 	if err := auth.GuardAuth(st, profile, "approvals"); err != nil {

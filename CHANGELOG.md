@@ -16,13 +16,30 @@ https://github.com/rawphp/laravel-capabilities-monorepo/blob/main/docs/versionin
 - Downloadable Go product CLI: auth, catalog, local JSON Schema validation (UX only),
   invoke via the server’s single HTTP capability API, optional MCP stdio bridge (D-016 / D-009).
 - No embedded domain logic; server re-validates and derives `caller: cli` from credentials.
+- Package-root `.goreleaser.yml` (GoReleaser v2): multi-arch `capabilities` binary
+  (darwin/linux/windows × amd64/arm64), `-X main.Version={{.Version}}` (strip `v` from
+  tag), `checksums.txt`; secret-gated platform signing via `scripts/sign-binary.sh`.
+- Secret-gated macOS codesign/notarization + Windows Authenticode scaffold
+  (workflow conditions + soft-skip hooks). See `docs/release-signing.md`. When secrets
+  are absent, releases still publish unsigned multi-arch assets + checksums.
+- **Release automation path:** monorepo git tag `v*` → package split/mirror → child-repo
+  GitHub Release on `rawphp/capabilities-cli` (`.github/workflows/release.yml` + GoReleaser).
+  Install/download pointer and residual wording updated in package README, `dist/README.md`,
+  and user guide.
+- Maintainer path map: `docs/release-path.md` (entry monorepo `v*` tag → terminal GitHub
+  Release; package-owned only — no PHP-remote release jobs).
 
 ### Notes
 
-- **Not a Packagist package** (Go module). Distributed as source / future binary artifacts under `dist/`.
+- **Not a Packagist package** (Go module). Preferred consumer install is a **GitHub Release**
+  binary from the mirrored package remote; source build and ad-hoc cross-compile remain
+  documented (`dist/` matrix + ldflags).
 - Module path: `github.com/rawphp/capabilities-cli` (see `go.mod`).
-- Version marker for prep is the monorepo git tag pattern `v0.Y.Z` (mirrored to this package remote); binary embedding is a later release step.
+- Version marker is the monorepo git tag pattern `v0.Y.Z` (mirrored to this package remote);
+  release builds inject the tag-without-`v` via ldflags (see `dist/README.md`).
 - This package tree is mirrored from the monorepo to `github.com/rawphp/capabilities-cli` on push.
+- Platform **signing** still depends on secrets configured on the child repo; without them
+  releases publish unsigned multi-arch assets (not a hard release failure).
 
 <!--
   First tagged 0.x.y scaffold (Keep a Changelog):
