@@ -13,8 +13,11 @@ import (
 	"github.com/rawphp/capabilities-cli/internal/api"
 	"github.com/rawphp/capabilities-cli/internal/auth"
 	"github.com/rawphp/capabilities-cli/internal/catalog"
+	"github.com/rawphp/capabilities-cli/internal/flagschema"
+	"github.com/rawphp/capabilities-cli/internal/helpfmt"
 	"github.com/rawphp/capabilities-cli/internal/mcpstdio"
 	"github.com/rawphp/capabilities-cli/internal/run"
+	"github.com/rawphp/capabilities-cli/internal/synth"
 )
 
 // Version is the CLI version string printed by `capabilities version`.
@@ -29,6 +32,10 @@ var Version = "0.2.0"
 // BinaryName is the product binary name (D-016).
 const BinaryName = "capabilities"
 
+// SchemaLookup returns describe-like schema data for capability help (tests inject this).
+// Returns empty maps when the capability is unknown to the lookup.
+type SchemaLookup func(canonical string) (description, schemaVersion string, inputSchema, outputSchema map[string]any)
+
 // Env wires IO and config roots for testability.
 type Env struct {
 	Args   []string
@@ -41,9 +48,21 @@ type Env struct {
 	NewClient func(baseURL, token string) *api.Client
 	// Now for deprecation checks.
 	Now time.Time
+	// Index optional synth index override (tests / pre-built cache). When set,
+	// domain/verb dispatch uses it without loading the remote catalog.
+	Index *synth.Index
+	// Summaries optional catalog rows for domain-help descriptions (tests).
+	Summaries []catalog.CapabilitySummary
+	// SchemaFor optional schema provider for capability --help without HTTP.
+	SchemaFor SchemaLookup
 }
 
 // Execute parses args and runs a subcommand. Returns process exit code.
+//
+// Argv dispatch (design):
+//  1. Reserved meta-commands always win (auth catalog describe run mcp approvals version help).
+//  2. Else known domain in catalog synth index → domain help or capability command / --help.
+//  3. Else unknown → not_found envelope + catalog/run hint, exit 5.
 func Execute(env Env) int {
 	if env.Stdout == nil {
 		env.Stdout = os.Stdout
@@ -62,6 +81,7 @@ func Execute(env Env) int {
 	cmd := args[0]
 	rest := args[1:]
 
+	// 1) Reserved meta always wins over domain tokens of the same name.
 	switch cmd {
 	case "help", "-h", "--help":
 		if len(rest) > 0 {
@@ -86,8 +106,8 @@ func Execute(env Env) int {
 	case "approvals":
 		return cmdApprovals(env, rest)
 	default:
-		fmt.Fprintf(env.Stderr, "unknown command %q\n\n%s", cmd, RootHelp())
-		return api.ExitValidation
+		// 2/3) Domain/verb synthesis or unknown.
+		return cmdDomainOrUnknown(env, cmd, rest)
 	}
 }
 
@@ -162,7 +182,6 @@ func flagBool(args []string, names ...string) (bool, []string) {
 	}
 	return found, out
 }
-
 
 // wantsHelp reports whether args contain a help flag (-h or --help).
 // Help wins before auth/network/side effects for any subcommand.
@@ -289,18 +308,244 @@ func cmdCatalog(env Env, args []string) int {
 		fmt.Fprintln(env.Stderr, err.Error())
 		return api.ExitInternal
 	}
+	// Client-side mapping enrichment for agents (cli, mapped_command, mapping_error).
+	list = catalog.EnrichSummaries(list)
 	if jsonOut {
 		fmt.Fprintln(env.Stdout, string(catalog.EnvelopeJSON(list)))
 	} else {
 		for _, cap := range list {
 			line := cap.Name
+			if cap.MappedCommand != "" {
+				line += " → " + cap.MappedCommand
+			}
 			if cap.Deprecated {
 				line += " (deprecated)"
+			}
+			if cap.MappingError != "" {
+				line += " [mapping_error=" + cap.MappingError + "]"
 			}
 			fmt.Fprintln(env.Stdout, line)
 		}
 	}
 	return api.ExitOK
+}
+
+// cmdDomainOrUnknown handles synthesized domain/verb commands or unknown argv[0].
+func cmdDomainOrUnknown(env Env, domain string, args []string) int {
+	idx, summaries, code := loadSynthIndex(env)
+	if code != 0 {
+		return code
+	}
+	// Known domain?
+	verbs := idx.Domains[domain]
+	if verbs == nil {
+		return writeNotFound(env, fmt.Sprintf("unknown command or domain %q", domain),
+			"try: capabilities catalog  |  capabilities run <name>  |  capabilities help")
+	}
+
+	profile, base, args := profileAndBase(args)
+	jsonOut, args := flagBool(args, "--json")
+	noCache, args := flagBool(args, "--no-cache")
+	helpWanted := wantsHelp(args)
+	args = stripHelpFlags(args)
+
+	verb, rest := takeFirstPositional(args)
+	if verb == "" {
+		// Domain-level help (missing verb, or domain --help only).
+		return writeDomainHelp(env, domain, idx, summaries, jsonOut)
+	}
+	if helpWanted {
+		canonical, ok := idx.Lookup(domain, verb)
+		if !ok {
+			return writeNotFound(env, fmt.Sprintf("unknown verb %q for domain %q", verb, domain),
+				fmt.Sprintf("try: capabilities %s --help", domain))
+		}
+		return writeCapabilityHelp(env, domain, verb, canonical, jsonOut, profile, base, noCache)
+	}
+
+	// Capability invoke — same pipeline as `run` (flagschema merge + HTTP).
+	canonical, ok := idx.Lookup(domain, verb)
+	if !ok {
+		return writeNotFound(env, fmt.Sprintf("unknown verb %q for domain %q", verb, domain),
+			fmt.Sprintf("try: capabilities %s --help", domain))
+	}
+	input, rest := flagValue(rest, "--input")
+	inputFile, rest := flagValue(rest, "--input-file")
+	idem, rest := flagValue(rest, "--idempotency-key")
+	tenant, rest := flagValue(rest, "--tenant")
+	human, rest := flagBool(rest, "--human")
+	retryLast, rest := flagBool(rest, "--retry-last")
+	// jsonOut/noCache/profile/base already peeled above
+	st := store(env)
+	return invokeCapability(env, st, profile, base, canonical, input, inputFile, idem, tenant, jsonOut, human, noCache, retryLast, rest)
+}
+
+// loadSynthIndex returns the synthesis index and optional summaries.
+// Prefers env.Index (tests); otherwise loads catalog when authenticated.
+// When unauthenticated and no Index, returns empty index so unknown tokens → exit 5.
+func loadSynthIndex(env Env) (*synth.Index, []catalog.CapabilitySummary, int) {
+	if env.Index != nil {
+		return env.Index, env.Summaries, 0
+	}
+	st := store(env)
+	profile := "default"
+	// Best-effort profile from args is not available here; default is fine for index load.
+	if err := auth.GuardAuth(st, profile, "catalog"); err != nil {
+		// No remote index — treat non-reserved as unknown (exit 5 at caller).
+		return &synth.Index{Domains: map[string]map[string]string{}, Rows: map[string]synth.Row{}}, nil, 0
+	}
+	c, err := clientFor(env, st, profile, "")
+	if err != nil {
+		return &synth.Index{Domains: map[string]map[string]string{}, Rows: map[string]synth.Row{}}, nil, 0
+	}
+	svc := &catalog.Service{Client: c, Cache: catalog.NewCache(st.SchemaCacheDir(profile))}
+	list, _, err := svc.List(context.Background())
+	if err != nil {
+		if se, ok := err.(*api.StructuredError); ok {
+			fmt.Fprintln(env.Stderr, se.Error())
+			return nil, nil, se.ExitCode
+		}
+		fmt.Fprintln(env.Stderr, err.Error())
+		return nil, nil, api.ExitInternal
+	}
+	return catalog.BuildIndex(list), list, 0
+}
+
+func writeDomainHelp(env Env, domain string, idx *synth.Index, summaries []catalog.CapabilitySummary, jsonOut bool) int {
+	byName := make(map[string]catalog.CapabilitySummary, len(summaries))
+	for _, s := range summaries {
+		byName[s.Name] = s
+	}
+	verbNames := idx.SortedVerbs(domain)
+	verbs := make([]helpfmt.DomainVerb, 0, len(verbNames))
+	for _, v := range verbNames {
+		name := idx.Domains[domain][v]
+		dv := helpfmt.DomainVerb{Verb: v, Name: name}
+		if s, ok := byName[name]; ok {
+			dv.Description = s.Description
+		}
+		verbs = append(verbs, dv)
+	}
+	if jsonOut {
+		fmt.Fprint(env.Stdout, string(DomainHelpJSON(domain, verbs)))
+	} else {
+		fmt.Fprint(env.Stdout, DomainHelpHuman(domain, verbs))
+	}
+	return api.ExitOK
+}
+
+func writeCapabilityHelp(env Env, domain, verb, canonical string, jsonOut bool, profile, base string, noCache bool) int {
+	info := helpfmt.CapabilityInfo{
+		Domain: domain,
+		Verb:   verb,
+		Name:   canonical,
+	}
+	if env.SchemaFor != nil {
+		desc, ver, in, out := env.SchemaFor(canonical)
+		info.Description = desc
+		info.SchemaVersion = ver
+		info.InputSchema = in
+		info.OutputSchema = out
+	} else {
+		// Load schema via describe (auth required).
+		st := store(env)
+		if profile == "" {
+			profile = "default"
+		}
+		if err := auth.GuardAuth(st, profile, "describe"); err != nil {
+			fmt.Fprintln(env.Stderr, err.Error())
+			return api.ExitAuth
+		}
+		c, err := clientFor(env, st, profile, base)
+		if err != nil {
+			fmt.Fprintln(env.Stderr, err.Error())
+			return api.ExitAuth
+		}
+		svc := &catalog.Service{Client: c, Cache: catalog.NewCache(st.SchemaCacheDir(profile)), NoCache: noCache}
+		entry, _, err := svc.Describe(context.Background(), canonical)
+		if err != nil {
+			if se, ok := err.(*api.StructuredError); ok {
+				fmt.Fprintln(env.Stderr, se.Error())
+				return se.ExitCode
+			}
+			fmt.Fprintln(env.Stderr, err.Error())
+			return api.ExitInternal
+		}
+		info.Description = "" // describe wire may not always include description
+		if entry.CLI != nil {
+			// prefer index domain/verb already set
+		}
+		info.SchemaVersion = entry.SchemaVersion
+		info.Name = entry.Name
+		if entry.Canonical != "" {
+			info.Name = entry.Canonical
+		}
+		info.InputSchema = rawToMap(entry.InputSchema)
+		info.OutputSchema = rawToMap(entry.OutputSchema)
+	}
+	if jsonOut {
+		fmt.Fprint(env.Stdout, string(CapabilityHelpJSON(info)))
+	} else {
+		fmt.Fprint(env.Stdout, CapabilityHelpHuman(info))
+	}
+	return api.ExitOK
+}
+
+func rawToMap(raw json.RawMessage) map[string]any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return map[string]any{}
+	}
+	return m
+}
+
+func writeNotFound(env Env, message, hint string) int {
+	envBody := api.ErrorEnvelope{
+		OK: false,
+		Error: &api.ErrorBody{
+			Code:      api.CodeNotFound,
+			Message:   message,
+			Retryable: false,
+		},
+	}
+	b, _ := json.MarshalIndent(envBody, "", "  ")
+	fmt.Fprintln(env.Stdout, string(b))
+	fmt.Fprintln(env.Stderr, message)
+	if hint != "" {
+		fmt.Fprintln(env.Stderr, "Hint:", hint)
+	}
+	return api.ExitDomain
+}
+
+// stripHelpFlags removes -h / --help from args.
+func stripHelpFlags(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// takeFirstPositional returns the first non-flag argument and remaining args (flags + later positionals).
+func takeFirstPositional(args []string) (pos string, rest []string) {
+	rest = make([]string, 0, len(args))
+	for i, a := range args {
+		if strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			continue
+		}
+		// First positional is the verb (or subcommand token).
+		pos = a
+		rest = append(rest, args[i+1:]...)
+		return pos, rest
+	}
+	return "", rest
 }
 
 func cmdDescribe(env Env, args []string) int {
@@ -361,6 +606,7 @@ func cmdRun(env Env, args []string) int {
 	idem, args := flagValue(args, "--idempotency-key")
 	tenant, args := flagValue(args, "--tenant")
 	jsonOut, args := flagBool(args, "--json")
+	human, args := flagBool(args, "--human")
 	noCache, args := flagBool(args, "--no-cache")
 	retryLast, args := flagBool(args, "--retry-last")
 	if len(args) == 0 {
@@ -368,6 +614,19 @@ func cmdRun(env Env, args []string) int {
 		return api.ExitValidation
 	}
 	name := args[0]
+	flagArgs := args[1:]
+	return invokeCapability(env, st, profile, base, name, input, inputFile, idem, tenant, jsonOut, human, noCache, retryLast, flagArgs)
+}
+
+// invokeCapability is the single validate→key→POST path for run and domain/verb (ORI-175).
+func invokeCapability(
+	env Env,
+	st *auth.Store,
+	profile, base, name string,
+	input, inputFile, idem, tenant string,
+	jsonOut, human, noCache, retryLast bool,
+	flagArgs []string,
+) int {
 	if err := auth.GuardAuth(st, profile, "run"); err != nil {
 		fmt.Fprintln(env.Stderr, err.Error())
 		return api.ExitAuth
@@ -378,21 +637,70 @@ func cmdRun(env Env, args []string) int {
 		return api.ExitAuth
 	}
 	svc := &catalog.Service{Client: c, Cache: catalog.NewCache(st.SchemaCacheDir(profile)), NoCache: noCache}
+
+	// Load schema for flag merge (cache / describe).
+	var schemaJSON []byte
+	entry, _, derr := svc.Describe(context.Background(), name)
+	if derr == nil && entry != nil {
+		schemaJSON = entry.InputSchema
+	}
+
+	fs, ferr := flagschema.FromJSONSchema(schemaJSON)
+	if ferr != nil {
+		fmt.Fprintln(env.Stderr, ferr.Error())
+		return api.ExitValidation
+	}
+
+	// Base JSON from --input / --input-file.
+	var baseJSON []byte
+	if inputFile != "" {
+		b, rerr := os.ReadFile(inputFile)
+		if rerr != nil {
+			fmt.Fprintln(env.Stderr, "read input file:", rerr.Error())
+			return api.ExitValidation
+		}
+		baseJSON = b
+	} else if input != "" {
+		baseJSON = []byte(input)
+	}
+
+	flagMap, rest, cerr := flagschema.CollectFlags(flagArgs)
+	if cerr != nil {
+		fmt.Fprintln(env.Stderr, cerr.Error())
+		return api.ExitValidation
+	}
+	if len(rest) > 0 {
+		fmt.Fprintf(env.Stderr, "unexpected arguments: %s (see --help)\n", strings.Join(rest, " "))
+		return api.ExitValidation
+	}
+
+	merged, merr := fs.MergeJSON(baseJSON, flagMap)
+	if merr != nil {
+		fmt.Fprintln(env.Stderr, merr.Error())
+		// Point agents at help for required / usage errors.
+		if strings.Contains(merr.Error(), "required") || strings.Contains(merr.Error(), "unknown flag") {
+			fmt.Fprintln(env.Stderr, "hint: capabilities run", name, "--help")
+		}
+		return api.ExitValidation
+	}
+
 	opts := run.Options{
 		Profile:        profile,
 		BaseURL:        base,
 		Capability:     name,
-		InputJSON:      []byte(input),
-		InputFile:      inputFile,
+		InputJSON:      merged,
 		IdempotencyKey: idem,
 		RetryLast:      retryLast,
 		NoCache:        noCache,
-		JSON:           jsonOut,
+		JSON:           true, // always machine envelope
+		Human:          human,
 		TenantHint:     tenant,
 		Store:          st,
 		Client:         c,
 		Catalog:        svc,
 	}
+	// JSON field kept true for compatibility; Run always writes envelope to stdout.
+	_ = jsonOut
 	result := run.Run(context.Background(), opts)
 	if result.Stderr != "" {
 		fmt.Fprint(env.Stderr, result.Stderr)
@@ -405,7 +713,7 @@ func cmdRun(env Env, args []string) int {
 		if !strings.HasSuffix(result.Stdout, "\n") {
 			fmt.Fprintln(env.Stdout)
 		}
-	} else if jsonOut && len(result.Envelope) > 0 {
+	} else if len(result.Envelope) > 0 {
 		fmt.Fprintln(env.Stdout, string(result.Envelope))
 	}
 	return result.ExitCode

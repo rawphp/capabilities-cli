@@ -3,17 +3,20 @@ package main
 import (
 	"strings"
 
+	"github.com/rawphp/capabilities-cli/internal/helpfmt"
 	"github.com/rawphp/capabilities-cli/internal/run"
 )
 
 // RootHelp is the top-level help text.
+// Lists reserved meta-commands and a short discovery pointer — not full schemas.
 func RootHelp() string {
 	return `capabilities — product capability CLI (HTTP client, D-016)
 
 USAGE:
   capabilities <command> [flags]
+  capabilities <domain> <verb> [flags]
 
-COMMANDS:
+RESERVED COMMANDS:
   auth        Login / logout / status (keychain token store)
   catalog     List capabilities from the remote HTTP API
   describe    Show JSON Schema for a capability
@@ -22,6 +25,12 @@ COMMANDS:
   approvals   Accept or reject pending approvals
   version     Print version
   help        Show help
+
+DISCOVERY:
+  capabilities catalog [--json]              list capabilities (mapped_command when known)
+  capabilities <domain> --help               list verbs under a domain
+  capabilities <domain> <verb> --help        schema-first capability help (fields + pass mode)
+  capabilities run <name>                    always works for unmapped / canonical names
 
 FLAGS (common):
   --profile=NAME     Auth profile (default: default)
@@ -37,10 +46,12 @@ NOTES:
   - Local schema validation is UX only; server always re-validates.
   - Caller is server-derived from credentials — never spoof X-Capabilities-Caller.
   - Examples never embed domain business logic; they only call the HTTP API.
+  - Root help does not dump full input/output schemas for the catalog.
 
 EXAMPLES:
   capabilities auth login --base-url=https://app.example.com
-  capabilities catalog
+  capabilities catalog --json
+  capabilities invoices create --help
   capabilities describe create-invoice
   capabilities run create-invoice --input='{"customer_id":42,"amount_cents":2500,"currency":"USD"}' --json
   capabilities mcp
@@ -139,4 +150,25 @@ func CommandExists(name string) bool {
 		return true
 	}
 	return false
+}
+
+// CapabilityHelpHuman formats schema-driven human capability help (INPUT table, OUTPUT, examples).
+// Domain/Verb empty → run <name> usage (domain/verb null in machine form).
+func CapabilityHelpHuman(info helpfmt.CapabilityInfo) string {
+	return helpfmt.FormatHumanCapability(helpfmt.BuildCapabilityHelp(info))
+}
+
+// CapabilityHelpJSON returns the machine capability_help envelope for --help --json (stdout; no invoke).
+func CapabilityHelpJSON(info helpfmt.CapabilityInfo) []byte {
+	return helpfmt.FormatMachineCapability(helpfmt.BuildCapabilityHelp(info))
+}
+
+// DomainHelpHuman lists domain verbs with one-line descriptions and canonical names.
+func DomainHelpHuman(domain string, verbs []helpfmt.DomainVerb) string {
+	return helpfmt.FormatHumanDomain(domain, verbs)
+}
+
+// DomainHelpJSON returns the machine domain_help list envelope (--json).
+func DomainHelpJSON(domain string, verbs []helpfmt.DomainVerb) []byte {
+	return helpfmt.FormatMachineDomain(domain, verbs)
 }
