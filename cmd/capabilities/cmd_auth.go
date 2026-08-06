@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/rawphp/capabilities-cli/internal/api"
@@ -17,6 +18,11 @@ func cmdAuth(env Env, args []string) int {
 	st := store(env)
 	sub := args[0]
 	rest := args[1:]
+	// Help wins before any side effects (login/logout) or flag requirements.
+	if sub == "help" || sub == "-h" || sub == "--help" || wantsHelp(rest) {
+		fmt.Fprint(env.Stdout, CommandHelp("auth"))
+		return api.ExitOK
+	}
 	profile, base, rest := profileAndBase(rest)
 	switch sub {
 	case "login":
@@ -66,12 +72,24 @@ func cmdAuth(env Env, args []string) int {
 		fmt.Fprintf(env.Stdout, "logged out profile=%s\n", profile)
 		return api.ExitOK
 	case "status":
+		jsonOut, rest := flagBool(rest, "--json")
+		_ = rest
 		p := st.Status(profile)
-		fmt.Fprintf(env.Stdout, "profile=%s base_url=%s logged_in=%v\n", p.Name, p.BaseURL, p.LoggedIn)
 		// Never print token.
-		return api.ExitOK
-	case "help", "-h", "--help":
-		fmt.Fprint(env.Stdout, CommandHelp("auth"))
+		if jsonOut {
+			payload := map[string]any{
+				"ok": true,
+				"data": map[string]any{
+					"profile":   p.Name,
+					"base_url":  p.BaseURL,
+					"logged_in": p.LoggedIn,
+				},
+			}
+			b, _ := json.MarshalIndent(payload, "", "  ")
+			fmt.Fprintln(env.Stdout, string(b))
+			return api.ExitOK
+		}
+		fmt.Fprintf(env.Stdout, "profile=%s base_url=%s logged_in=%v\n", p.Name, p.BaseURL, p.LoggedIn)
 		return api.ExitOK
 	default:
 		fmt.Fprintf(env.Stderr, "unknown auth subcommand %q\n", sub)
